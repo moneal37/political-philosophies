@@ -3938,55 +3938,98 @@ function describe(){
  addEvidence(p,q?'A':'Placement');
  if(q){const qdesc=document.createElement('p');qdesc.textContent='B · '+q.description;details.append(qdesc);addEvidence(q,'B');}
 }
-// Update all overlay traces in ONE Plotly.restyle operation.
-// Previously six concurrent restyle operations triggered repeated 3D scene rebuilds,
-// which could freeze WebGL rendering when a point was selected.
-let overlayDrawing=false, overlayDirty=false, overlayQueued=false;
-const overlayIndices=()=>[...focusIndices,...guideIndices,connectorIndex];
-function overlayState(){
+// Screen-space guides: selection never calls Plotly.restyle or Plotly.react.
+// Plotly's actual 3D camera matrices are used to project points into an SVG overlay.
+// Screen-only guides avoid rebuilding the WebGL scene on selection.
+const svgNS='http://www.w3.org/2000/svg';
+const chartSection=gd.closest('.plot');
+chartSection.style.position='relative';
+const guideSvg=document.createElementNS(svgNS,'svg');
+guideSvg.setAttribute('aria-hidden','true');
+guideSvg.style.cssText='position:absolute;left:0;top:0;pointer-events:none;z-index:5;overflow:hidden';
+chartSection.appendChild(guideSvg);
+let svgUpdateQueued=false,dragging=false;
+function matrixVec(matrix,vector){
+ const r=[0,0,0,0];
+ for(let n=0;n<4;n++)for(let j=0;j<4;j++)r[j]+=matrix[n*4+j]*vector[n];
+ return r;
+}
+function projectPoint(p){
+ // Plotly's perspective projection can approach infinity near the camera.
+ // Never hand an offscreen/unbounded coordinate to SVG: certain camera angles
+ // produced positions over 10,000px for the historical constitutional marker.
+ const scene=gd._fullLayout?.scene?._scene;
+ const c=scene?.glplot?.cameraParams, ds=scene?.dataScale;
+ const box=scene?.container;
+ if(!c || !ds || !box || !c.model || !c.view || !c.projection)return null;
+ const xa=gd._fullLayout.scene.xaxis,ya=gd._fullLayout.scene.yaxis,za=gd._fullLayout.scene.zaxis;
+ const raw=[xa.r2l(p.x)*ds[0],ya.r2l(p.y)*ds[1],za.r2l(p.z)*ds[2],1];
+ if(!raw.every(Number.isFinite))return null;
+ const result=matrixVec(c.projection,matrixVec(c.view,matrixVec(c.model,raw)));
+ if(!Number.isFinite(result[3]) || result[3]<=0.000001)return null;
+ const ndcX=result[0]/result[3],ndcY=result[1]/result[3];
+ // Restrict projections to the screen and a small margin: guides should
+ // disappear gracefully when their endpoint passes behind or outside view.
+ if(!Number.isFinite(ndcX)||!Number.isFinite(ndcY)||Math.abs(ndcX)>1.8||Math.abs(ndcY)>1.8)return null;
+ const cr=box.getBoundingClientRect(),pr=chartSection.getBoundingClientRect();
+ const x=cr.left-pr.left+(.5+.5*ndcX)*cr.width;
+ const y=cr.top-pr.top+(.5-.5*ndcY)*cr.height;
+ const bound=Math.max(chartSection.clientWidth,gd.clientHeight)*2;
+ return Number.isFinite(x)&&Number.isFinite(y)&&Math.abs(x)<bound&&Math.abs(y)<bound?{x,y}:null;
+}
+function makeSvgNode(kind,attrs){
+ const el=document.createElementNS(svgNS,kind);
+ for(const [key,value] of Object.entries(attrs))el.setAttribute(key,String(value));
+ guideSvg.appendChild(el);return el;
+}
+function guideLine(a,b,color,width,dash,opacity){
+ if(!a||!b)return;
+ makeSvgNode('line',{x1:a.x,y1:a.y,x2:b.x,y2:b.y,stroke:color,'stroke-width':width,'stroke-dasharray':dash||'none','stroke-opacity':opacity,'stroke-linecap':'round'});
+}
+function highlightPoint(p,tag){
+ if(!p)return null;
+ const s=projectPoint(p);if(!s)return null;
+ makeSvgNode('circle',{cx:s.x,cy:s.y,r:12,fill:'none',stroke:'#fff','stroke-width':4,'stroke-opacity':.94});
+ makeSvgNode('circle',{cx:s.x,cy:s.y,r:11,fill:'none',stroke:p.color,'stroke-width':3.3});
+ if(tag){
+  makeSvgNode('circle',{cx:s.x+16,cy:s.y-15,r:10.5,fill:'#fff',stroke:p.color,'stroke-width':1.5});
+  const t=makeSvgNode('text',{x:s.x+16,y:s.y-11,'text-anchor':'middle','font-size':11,'font-weight':700,fill:p.color});t.textContent=tag;
+ }
+ return s;
+}
+function renderScreenGuides(){
+ if(!initialized)return;
+ const w=chartSection.clientWidth,h=gd.clientHeight;
+ guideSvg.style.width=w+'px';guideSvg.style.height=h+'px';
+ guideSvg.setAttribute('viewBox',`0 0 ${w} ${h}`);
+ guideSvg.replaceChildren();
  const a=pinA&&isVisible(pinA)?pinA:null;
  const b=compareMode&&pinB&&isVisible(pinB)?pinB:null;
- const h=hovered&&isVisible(hovered)&&!same(hovered,a)&&!same(hovered,b)?hovered:null;
- return {a,b,h};
+ const hpoint=hovered&&isVisible(hovered)&&!same(hovered,a)&&!same(hovered,b)?hovered:null;
+ const posA=a?projectPoint(a):null,posB=b?projectPoint(b):null;
+ for(const point of [a,b]){
+  if(!point||!guidesOn)continue;
+  const start=projectPoint(point);if(!start)continue;
+  for(const foot of [{x:point.x,y:0,z:0},{x:0,y:point.y,z:0},{x:0,y:0,z:point.z}]){
+   guideLine(start,projectPoint(foot),point.color,1.6,'4 4',.68);
+  }
+ }
+ if(posA&&posB)guideLine(posA,posB,'#526579',2.8,'7 4',.85);
+ if(hpoint)highlightPoint(hpoint,null);
+ if(a)highlightPoint(a,compareMode?'A':null);
+ if(b)highlightPoint(b,'B');
 }
-function xyzGuide(p){
- // Independent segments to each axis, with null separators (3D missing data).
- if(!p)return {x:[],y:[],z:[]};
- return {
-  x:[p.x,p.x,null,p.x,0,null,p.x,0],
-  y:[p.y,0,null,p.y,p.y,null,p.y,0],
-  z:[p.z,0,null,p.z,0,null,p.z,p.z]
- };
-}
-function buildOverlayUpdate(){
- const {a,b,h}=overlayState();
- const ga=guidesOn?xyzGuide(a):xyzGuide(null);
- const gb=guidesOn?xyzGuide(b):xyzGuide(null);
- const points=[a,b,h];
- const coords=[...points.map(p=>p?[p.x]:[]),ga.x,gb.x,(a&&b&&compareMode)?[a.x,b.x]:[]];
- const ys=[...points.map(p=>p?[p.y]:[]),ga.y,gb.y,(a&&b&&compareMode)?[a.y,b.y]:[]];
- const zs=[...points.map(p=>p?[p.z]:[]),ga.z,gb.z,(a&&b&&compareMode)?[a.z,b.z]:[]];
- const visible=[!!a,!!b,!!h,!!(a&&guidesOn),!!(b&&guidesOn),!!(a&&b&&compareMode)];
- const colors=[a?.color||'#365d83',b?.color||'#365d83',h?.color||'#365d83',a?.color||'#5686a4',b?.color||'#5686a4','#566475'];
- const text=[[a?(compareMode?'A · ':'')+a.name:''],[b?'B · '+b.name:''],[h?h.name:''],[],[],[]];
- return {x:coords,y:ys,z:zs,visible,text,'marker.color':colors,'line.color':colors};
-}
-async function flushOverlayUpdate(){
- if(!initialized || overlayDrawing)return;
- overlayDrawing=true;
- try {
-  do {
-   overlayDirty=false;
-   await Plotly.restyle(gd,buildOverlayUpdate(),overlayIndices());
-  } while(overlayDirty);
- }catch(err){console.error('Overlay update failed:',err);}
- finally {overlayDrawing=false;if(overlayDirty)scheduleOverlays();}
-}
+let lastOverlayTime=0;
 function scheduleOverlays(){
- overlayDirty=true;
- if(overlayQueued||overlayDrawing||!initialized)return;
- overlayQueued=true;
- requestAnimationFrame(()=>{overlayQueued=false;void flushOverlayUpdate();});
+ if(svgUpdateQueued||!initialized)return;
+ svgUpdateQueued=true;
+ requestAnimationFrame(now=>{
+  svgUpdateQueued=false;
+  // Limit projection work during continuous rotation, but always update on release.
+  if(dragging && now-lastOverlayTime<45)return;
+  lastOverlayTime=now;
+  try{renderScreenGuides()}catch(e){console.warn('Guide overlay not available',e);guideSvg.replaceChildren();}
+ });
 }
 function refresh(){
  for(const btn of legend.querySelectorAll('.legend-item')){
@@ -3994,12 +4037,23 @@ function refresh(){
   btn.classList.toggle('hovered',same(p,hovered));btn.classList.toggle('pinned',same(p,pinA));
   btn.classList.toggle('secondary',same(p,pinB));btn.classList.toggle('off',!isVisible(p));
   btn.setAttribute('aria-pressed',String(same(p,pinA)||same(p,pinB)));
-  btn.querySelector('.item-end').textContent=same(p,pinA)?(compareMode?'A':'●'):same(p,pinB)?'B':'';
+  const indicator=same(p,pinA)?(compareMode?'A':'●'):same(p,pinB)?'B':'';
+  const indicatorEl=btn.querySelector('.item-end');
+  if(indicatorEl.textContent!==indicator)indicatorEl.textContent=indicator;
  }
- describe();
+ describe();scheduleOverlays();
+}
+function hoverOnly(p){
+ // Hover is visual feedback only; don't reconstruct the details panel or
+ // change its size underneath a pointer over a scrollable legend.
+ if(same(p,hovered)||(!p&&!hovered))return;
+ hovered=p;
+ for(const btn of legend.querySelectorAll('.legend-item')){
+  const item=pointInfo[Number(btn.dataset.idx)];
+  btn.classList.toggle('hovered',same(item,hovered));
+ }
  scheduleOverlays();
 }
-
 function togglePin(p){
  if(!isVisible(p))return;
  if(!compareMode){pinA=same(pinA,p)?null:p;pinB=null;}
@@ -4032,8 +4086,8 @@ function buildControls(){
    const glyph=document.createElement('i');glyph.className='glyph '+(pt.kind==='movement'||pt.kind==='historical'?'diamond':pt.kind==='program'?'square':'circle');glyph.style.setProperty('--c',pt.color);
    const title=document.createElement('span');title.textContent=pt.name;const pin=document.createElement('span');pin.className='item-end';pin.textContent='';
    btn.append(glyph,title,pin);
-   btn.addEventListener('mouseenter',()=>{hovered=pt;refresh();});btn.addEventListener('mouseleave',()=>{hovered=null;refresh();});
-   btn.addEventListener('focus',()=>{hovered=pt;refresh();});btn.addEventListener('blur',()=>{hovered=null;refresh();});
+   btn.addEventListener('mouseenter',()=>hoverOnly(pt));btn.addEventListener('mouseleave',()=>{if(same(hovered,pt))hoverOnly(null);});
+   btn.addEventListener('focus',()=>hoverOnly(pt));btn.addEventListener('blur',()=>{if(same(hovered,pt))hoverOnly(null);});
    btn.addEventListener('click',()=>togglePin(pt));legend.append(btn);
   });
  }
@@ -4063,14 +4117,17 @@ document.getElementById('guide-toggle').onclick=function(){guidesOn=!guidesOn;th
 document.getElementById('label-toggle').onclick=function(){labels=!labels;this.setAttribute('aria-pressed',String(labels));this.textContent=labels?'Hide point labels':'Show point labels';
  groupDefs.forEach(g=>{const tr=gd.data[g.index];Plotly.restyle(gd,{mode:labels?'markers+text':'markers',text:[labels?tr.customdata.map(c=>c[0]):[]]},[g.index]);});
 };
-Plotly.newPlot(gd,traces,sceneLayout,{responsive:true,displaylogo:false,scrollZoom:true}).then(async()=>{
- buildControls();describe();
- const halo=(name,size)=>({type:'scatter3d',name,mode:'markers+text',visible:false,showlegend:false,hoverinfo:'skip',x:[0],y:[0],z:[0],text:[''],textposition:'top center',textfont:{size:14,color:'#21374c',family:'Arial,sans-serif'},marker:{size,opacity:1,color:'#365d83',symbol:'diamond',line:{color:'#fff',width:3}}});
- const guide=(name)=>({type:'scatter3d',name,mode:'lines',visible:false,showlegend:false,hoverinfo:'skip',x:[],y:[],z:[],line:{width:2.6,color:'#5686a4',dash:'dot'},opacity:0.58});
- const connector={type:'scatter3d',name:'Comparison line',mode:'lines',visible:false,showlegend:false,hoverinfo:'skip',x:[],y:[],z:[],line:{width:4,color:'#566475',dash:'dash'},opacity:.8};
- const base=gd.data.length;await Plotly.addTraces(gd,[halo('Selection A',15),halo('Selection B',15),halo('Legend hover',13),guide('A projection guides'),guide('B projection guides'),connector]);
- focusIndices=[base,base+1,base+2];guideIndices=[base+3,base+4];connectorIndex=base+5;initialized=true;refresh();
- // Graph selections also work without using the sidebar, only on the four real point traces.
+Plotly.newPlot(gd,traces,sceneLayout,{responsive:true,displaylogo:false,scrollZoom:true}).then(()=>{
+ buildControls();initialized=true;refresh();
  gd.on('plotly_click',e=>{const d=e.points&&e.points[0];if(d&&d.curveNumber<4){const p=pointInfo.find(p=>p.trace===d.curveNumber&&p.index===d.pointNumber);if(p)togglePin(p);}});
+ // The SVG always follows Plotly's camera, but never asks Plotly to redraw.
+ gd.on('plotly_relayout',scheduleOverlays);
+ gd.on('plotly_afterplot',scheduleOverlays);
+ gd.addEventListener('pointerdown',()=>{dragging=true});
+ window.addEventListener('pointerup',()=>{dragging=false;scheduleOverlays();});
+ gd.addEventListener('pointermove',()=>{if(dragging)scheduleOverlays();},{passive:true});
+ gd.addEventListener('wheel',scheduleOverlays,{passive:true});
+ window.addEventListener('resize',scheduleOverlays);
+ new ResizeObserver(scheduleOverlays).observe(gd);
 }).catch(e=>{console.error(e);document.getElementById('details').textContent='Could not load the 3D graph.'});
 </script></body></html>
